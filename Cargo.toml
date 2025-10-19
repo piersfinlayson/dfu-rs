@@ -1,0 +1,16 @@
+[package]
+name = "dfu-rs"
+version = "0.1.0"
+edition = "2024"
+authors = ["Piers Finlayson <piers@piers.rocks>"]
+license = "MIT OR Apache-2.0"
+description = "Device Firmware Update crate for hosts, using rusb and exposing a simple API."
+repository = "https://github.com/piersfinlayson/dfu-rs"
+homepage = "https://github.com/piersfinlayson/dfu-rs"
+documentation = "https://docs.rs/dfu-rs"
+keywords = ["embedded", "dfu", "usb", "firmware", "stm32"]
+categories = ["embedded", "hardware-support"]
+
+[dependencies]
+log = "0.4"
+rusb = "0.9"

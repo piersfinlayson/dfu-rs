@@ -44,7 +44,7 @@ use rusb::{Context, Device as RusbDevice, Error as RusbError, UsbContext};
 use std::time::Duration;
 
 // Timeout
-const DEFAULT_USB_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_USB_TIMEOUT: Duration = Duration::from_secs(30);
 
 // USB class/subclass codes for DFU
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xFE;
@@ -60,18 +60,234 @@ const USB_CLASS_INTERFACE_IN: u8 = 0xA1;  // Class, Interface, Device-to-Host
 // STM32 DFU commands (vendor-specific)
 const STM32_DFU_CMD_SET_ADDRESS: u8 = 0x21;
 const STM32_DFU_CMD_ERASE: u8 = 0x41;
+#[allow(dead_code)]
+const STM32_DFU_CMD_READ_UNPROTECT: u8 = 0x92;
 
 // DFU request types
-const DFU_UPLOAD: u8 = 0x02;
-const DFU_GETSTATUS: u8 = 0x03;
-const DFU_CLRSTATUS: u8 = 0x04;
-const DFU_ABORT: u8 = 0x06;
-const DFU_DNLOAD: u8 = 0x01;
-
-// DFU states
+#[derive(Debug, Clone, PartialEq)]
+#[repr(u8)]
 #[allow(dead_code)]
-const STATE_IDLE: u8 = 2;
-const STATE_ERROR: u8 = 10;
+enum Request {
+    Detach = 0,
+    Download = 1,
+    Upload = 2,
+    GetStatus = 3,
+    ClearStatus = 4,
+    GetState = 5,
+    Abort = 6,
+}
+
+impl Into<u8> for Request {
+    fn into(self) -> u8 {
+        self as u8
+    }
+}
+
+impl Request {
+    // Returns expected length of the request's data phase where known
+    const fn fixed_length(&self) -> usize {
+        match self {
+            Request::Detach => 0,
+            Request::Download => 0,
+            Request::Upload => 0,
+            Request::GetStatus => 6,
+            Request::ClearStatus => 0,
+            Request::GetState => 1,
+            Request::Abort => 0,
+        }
+    }
+}
+
+/// DFU Status codes
+#[derive(Debug, Clone, PartialEq)]
+#[repr(u8)]
+pub enum Status {
+    Ok = 0,
+    ErrTarget = 1,
+    ErrFile = 2,
+    ErrWrite = 3,
+    ErrErase = 4,
+    ErrCheckErased = 5,
+    ErrProg = 6,
+    ErrVerify = 7,
+    ErrAddress = 8,
+    ErrNotDone = 9,
+    ErrFirmware = 10,
+    ErrVendor = 11,
+    ErrUsbReset = 12,
+    ErrPowerOnReset = 13,
+    ErrUnknown = 14,
+    ErrStalledPkt = 15,
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Status::Ok => write!(f, "OK"),
+            Status::ErrTarget => write!(f, "Error: Target"),
+            Status::ErrFile => write!(f, "Error: File"),
+            Status::ErrWrite => write!(f, "Error: Write"),
+            Status::ErrErase => write!(f, "Error: Erase"),
+            Status::ErrCheckErased => write!(f, "Error: Check Erased"),
+            Status::ErrProg => write!(f, "Error: Program"),
+            Status::ErrVerify => write!(f, "Error: Verify"),
+            Status::ErrAddress => write!(f, "Error: Address"),
+            Status::ErrNotDone => write!(f, "Error: Not Done"),
+            Status::ErrFirmware => write!(f, "Error: Firmware"),
+            Status::ErrVendor => write!(f, "Error: Vendor"),
+            Status::ErrUsbReset => write!(f, "Error: USB Reset"),
+            Status::ErrPowerOnReset => write!(f, "Error: Power On Reset"),
+            Status::ErrUnknown => write!(f, "Error: Unknown"),
+            Status::ErrStalledPkt => write!(f, "Error: Stalled Packet"),
+        }
+    }
+}
+
+/// DFU Device State codes
+#[derive(Debug, Clone, PartialEq)]
+#[repr(u8)]
+pub enum State {
+    AppIdle = 0,
+    AppDetach = 1,
+    DfuIdle = 2,
+    DfuDnloadSync = 3,
+    DfuDnloadBusy = 4,
+    DfuDnloadIdle = 5,
+    DfuManifestSync = 6,
+    DfuManifest = 7,
+    DfuManifestWaitReset = 8,
+    DfuUploadIdle = 9,
+    DfuError = 10,
+}
+
+impl std::fmt::Display for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            State::AppIdle => write!(f, "App Idle"),
+            State::AppDetach => write!(f, "App Detach"),
+            State::DfuIdle => write!(f, "DFU Idle"),
+            State::DfuDnloadSync => write!(f, "DFU Download Sync"),
+            State::DfuDnloadBusy => write!(f, "DFU Download Busy"),
+            State::DfuDnloadIdle => write!(f, "DFU Download Idle"),
+            State::DfuManifestSync => write!(f, "DFU Manifest Sync"),
+            State::DfuManifest => write!(f, "DFU Manifest"),
+            State::DfuManifestWaitReset => write!(f, "DFU Manifest Wait Reset"),
+            State::DfuUploadIdle => write!(f, "DFU Upload Idle"),
+            State::DfuError => write!(f, "DFU Error"),
+        }
+    }
+}
+
+// Status returned by the DFU device
+struct DeviceStatus {
+    status: Status,
+    state: State,
+    poll_time: u32,
+    string: u8,
+}
+
+#[allow(dead_code)]
+impl DeviceStatus {
+    fn status(&self) -> Status {
+        self.status.clone()
+    }
+
+    fn state(&self) -> State {
+        self.state.clone()
+    }
+
+    fn poll_time(&self) -> u32 {
+        self.poll_time
+    }
+
+    fn string_index(&self) -> u8 {
+        self.string
+    }
+
+    fn is_error(&self) -> bool {
+        self.is_status_error() || self.is_state_error()
+    }
+
+    fn is_status_error(&self) -> bool {
+        self.status != Status::Ok
+    }
+
+    fn is_state_error(&self) -> bool {
+        self.state == State::DfuError
+    }
+
+    fn is_state_dfu_idle(&self) -> bool {
+        self.state == State::DfuIdle
+    }
+
+    fn is_download_busy(&self) -> bool {
+        self.state == State::DfuDnloadBusy
+    }
+
+    fn is_download_manifest(&self) -> bool {
+        self.state == State::DfuManifest || self.state == State::DfuManifestSync
+    }
+
+    fn from_packet(data: &[u8]) -> Result<Self, Error> {
+        if data.len() < Request::GetStatus.fixed_length() {
+            warn!("Invalid DFU device status packet length: {}", data.len());
+            return Err(Error::DfuInvalidDeviceStatus);
+        }
+
+        let status = match data[0] {
+            0 => Status::Ok,
+            1 => Status::ErrTarget,
+            2 => Status::ErrFile,
+            3 => Status::ErrWrite,
+            4 => Status::ErrErase,
+            5 => Status::ErrCheckErased,
+            6 => Status::ErrProg,
+            7 => Status::ErrVerify,
+            8 => Status::ErrAddress,
+            9 => Status::ErrNotDone,
+            10 => Status::ErrFirmware,
+            11 => Status::ErrVendor,
+            12 => Status::ErrUsbReset,
+            13 => Status::ErrPowerOnReset,
+            14 => Status::ErrUnknown,
+            15 => Status::ErrStalledPkt,
+            _ => {
+                warn!("Unknown DFU status code: {}", data[0]);
+                return Err(Error::DfuInvalidDeviceStatus)
+            }
+        };
+
+        let state = match data[4] {
+            0 => State::AppIdle,
+            1 => State::AppDetach,
+            2 => State::DfuIdle,
+            3 => State::DfuDnloadSync,
+            4 => State::DfuDnloadBusy,
+            5 => State::DfuDnloadIdle,
+            6 => State::DfuManifestSync,
+            7 => State::DfuManifest,
+            8 => State::DfuManifestWaitReset,
+            9 => State::DfuUploadIdle,
+            10 => State::DfuError,
+            _ => {
+                warn!("Unknown DFU state code: {}", data[4]);
+                return Err(Error::DfuInvalidDeviceStatus);
+            }
+        };
+
+        let poll_time = u32::from_le_bytes([data[1], data[2], data[3], 0]);
+        let string = data[5];
+
+        trace!("Device Status: status={}, state={}, poll_time={}ms, string={}", status, state, poll_time, string);
+
+        Ok(DeviceStatus {
+            status,
+            state,
+            poll_time,
+            string,
+        })
+    }
+}
 
 /// DFU Type enumeration - each USB DFU device can represent different memory
 /// regions, represented by this object
@@ -126,9 +342,13 @@ pub enum Error {
     DeviceNotFound,
     /// DFU status error returned by device
     DfuStatus{
-        error: u8,
-        state: u8,
+        status: Status,
+        state: State,
     },
+    /// Invalid DFU device status response
+    DfuInvalidDeviceStatus,
+    /// DFU set address pointer failed
+    DfuSetAddressFailed(Status, State),
     UsbContext(RusbError),
     UsbDeviceEnumeration(RusbError),
     UsbDeviceOpen(RusbError),
@@ -142,6 +362,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::DeviceNotFound => write!(f, "DFU Device Not Found"),
+            Error::DfuStatus{ status, state } => write!(f, "DFU Status Error: status code {}, state {}", status, state),
+            Error::DfuInvalidDeviceStatus => write!(f, "DFU Invalid Device Status"),
+            Error::DfuSetAddressFailed(status, state) => write!(f, "DFU Set Address Failed: status code {}, state {}", status, state),
             Error::UsbContext(e) => write!(f, "USB Context Error: {}", e),
             Error::UsbDeviceEnumeration(e) => write!(f, "USB Device Enumeration Error: {}", e),
             Error::UsbDeviceOpen(e) => write!(f, "Device Open Error: {}", e),
@@ -149,7 +372,6 @@ impl std::fmt::Display for Error {
             Error::UsbClaimInterface(e) => write!(f, "Claim Interface Error: {}", e),
             Error::UsbSetAltSetting(e) => write!(f, "Set Alternate Setting Error: {}", e),
             Error::UsbControlTransfer(e) => write!(f, "Control Transfer Error: {}", e),
-            Error::DfuStatus{ error, state } => write!(f, "DFU Status Error: error code {}, state {}", error, state),
         }
     }
 }
@@ -379,12 +601,12 @@ impl Device {
         let (_context, handle) = self.open_device()?;
         trace!("DFU device opened successfully");
         
-        // Mass erase command: 0x41 followed by 0xFF
-        let cmd = vec![STM32_DFU_CMD_ERASE, 0xFF];
+        // Mass erase command: Just hte command byte
+        let cmd = vec![STM32_DFU_CMD_ERASE];
         
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_DNLOAD,
+            Request::Download.into(),
             0,
             self.info.interface as u16,
             &cmd,
@@ -392,7 +614,7 @@ impl Device {
         ).map_err(|e| Error::UsbControlTransfer(e))?;
         
         // Wait for erase to complete
-        self.get_status(&handle)?;
+        self.get_status_check_download_busy(&handle)?;
         self.get_status(&handle)?;
         
         trace!("DFU mass erase completed successfully");
@@ -423,10 +645,6 @@ impl Device {
         self.set_address(&handle, address)?;
         trace!("DFU address set successfully");
         
-        // Abort to return to dfuIDLE before download
-        self.abort(&handle, false)?;
-        trace!("DFU aborted to enter dfuIDLE state");
-        
         // Calculate blocks needed
         let total_blocks = (bytes.len() + DFU_BLOCK_SIZE - 1) / DFU_BLOCK_SIZE;
         
@@ -443,7 +661,7 @@ impl Device {
         // Send zero-length download to complete the transfer
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_DNLOAD,
+            Request::Download.into(),
             0,
             self.info.interface as u16,
             &[],
@@ -464,7 +682,7 @@ impl Device {
         trace!("Clearing DFU status");
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_CLRSTATUS,
+            Request::ClearStatus.into(),
             0,
             self.info.interface as u16,
             &[],
@@ -508,7 +726,7 @@ impl Device {
 
         // Initialize the DFU state machine
         let needs_clear = match self.get_status(&handle) {
-            Ok(state) => state == STATE_ERROR,
+            Ok(status) => status.is_state_error(),
             Err(_) => true,  // getStatus failed, needs initialization
         };
 
@@ -517,6 +735,9 @@ impl Device {
             self.get_status(&handle)?;
         }
         
+        // Ensure device is in dfuIDLE state for subsequent operations
+        self.abort(&handle, false)?;
+
         Ok((context, handle))
     }
     
@@ -530,16 +751,17 @@ impl Device {
         
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_DNLOAD,
+            Request::Download.into(),
             0,    // wValue: 0 for command mode
             self.info.interface as u16,
             &cmd,
             self.timeout
         )
-            .inspect_err(|e| trace!("Control transfer error during set_address: {e}"))
+            .inspect_err(|e| warn!("Control transfer error during set_address: {e}"))
             .map_err(|e| Error::UsbControlTransfer(e))?;
         
-        self.get_status(handle)?;
+        // First get status after write address should return download busy
+        self.get_status_check_download_busy(handle)?;
         self.get_status(handle)?;
         
         Ok(())
@@ -554,7 +776,7 @@ impl Device {
         
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_DNLOAD,
+            Request::Download.into(),
             0,    // wValue: 0 for command mode
             self.info.interface as u16,
             &cmd,
@@ -562,7 +784,7 @@ impl Device {
         ).map_err(|e| Error::UsbControlTransfer(e))?;
         
         // Wait for erase to complete - can take significant time
-        self.get_status(handle)?;
+        self.get_status_check_download_busy(handle)?;
         self.get_status(handle)?;
         
         Ok(())
@@ -572,7 +794,7 @@ impl Device {
         trace!("Sending DFU abort");
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_ABORT,
+            Request::Abort.into(),
             0,
             self.info.interface as u16,
             &[],
@@ -592,7 +814,7 @@ impl Device {
         
         let bytes_read = handle.read_control(
             USB_CLASS_INTERFACE_IN,
-            DFU_UPLOAD,
+            Request::Upload.into(),
             (2 + block) as u16, // wValue: block number + 2
             self.info.interface as u16,
             &mut buf,
@@ -616,7 +838,7 @@ impl Device {
         
         handle.write_control(
             USB_CLASS_INTERFACE_OUT,
-            DFU_DNLOAD,
+            Request::Download.into(),
             (2 + block) as u16, // wValue: block number + 2
             self.info.interface as u16,
             &block_data,
@@ -624,37 +846,48 @@ impl Device {
         ).map_err(|e| Error::UsbControlTransfer(e))?;
         
         // Wait for write to complete
+        self.get_status_check_download_busy(handle)?;
         self.get_status(handle)?;
-        self.get_status(handle)?;
-        
+
         Ok(())
     }
 
-    fn get_status(&self, handle: &rusb::DeviceHandle<Context>) -> Result<u8, Error> {
+    // Returns Err(Error) if device is not in download busy state
+    fn get_status_check_download_busy(&self, handle: &rusb::DeviceHandle<Context>) -> Result<(), Error> {
+        let status = self.get_status_error_flag(handle, true)?;
+        if !status.is_download_busy() {
+            return Err(Error::DfuStatus{ status: status.status(), state: status.state() })
+        }
+        Ok(())
+    }
+
+    // Returns Err(Error) if any error status/state is reported
+    fn get_status(&self, handle: &rusb::DeviceHandle<Context>) -> Result<DeviceStatus, Error> {
+        self.get_status_error_flag(handle, false)
+    }
+
+    fn get_status_error_flag(&self, handle: &rusb::DeviceHandle<Context>, error_ok: bool) -> Result<DeviceStatus, Error> {
         trace!("Getting DFU status");
-        let mut status = [0u8; 6];
-        
+        let mut data = [0u8; Request::GetStatus.fixed_length()];
         handle.read_control(
             USB_CLASS_INTERFACE_IN,
-            DFU_GETSTATUS,
+            Request::GetStatus.into(),
             0,
             self.info.interface as u16,
-            &mut status,
+            &mut data,
             self.timeout
         ).map_err(|e| Error::UsbControlTransfer(e))?;
-        
-        let error = status[0];
-        let state = status[4];
-        let poll_time = status[1] as u64;
+
+        let status = DeviceStatus::from_packet(&data)?;
         
         // Wait for poll time
-        std::thread::sleep(std::time::Duration::from_millis(poll_time));
+        std::thread::sleep(std::time::Duration::from_millis(status.poll_time() as u64));
         
-        if error != 0 || state == STATE_ERROR {
-            return Err(Error::DfuStatus{ error, state} );
+        if !error_ok && status.is_error() {
+            return Err(Error::DfuStatus{ status: status.status(), state: status.state() });
         }
         
-        Ok(state)
+        Ok(status)
     }
 }
 

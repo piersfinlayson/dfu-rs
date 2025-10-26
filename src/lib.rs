@@ -4,14 +4,19 @@
 
 //! Implements DFU operations for USB devices.
 //! 
-//! Based on [`rusb`](https://docs.rs/rusb/latest/rusb/) for USB communication,
-//! this crate provides a simple interface for discovering DFU-capable devices
-//! and performing DFU operations.
+//! Based on the [`nusb`](https://docs.rs/nusb/latest/nusb/) native Rust stack
+//! for USB communication, this crate provides a simple interface for
+//! discovering DFU-capable devices and performing DFU operations.
 //! 
 //! It is designed for use in host applications that need to update firmware
 //! on embedded devices via USB DFU.
 //! 
 //! It is intended to work on Windows, Linux, and macOS.
+//! 
+//! On Windows, WinUSB must be installed for the target device.  This can be
+//! done via [Zadig](https://zadig.akeo.ie/), implementing a WCID descriptor
+//! in your device, or using [`wdi-rs`](https://docs.rs/wdi-rs/latest/wdi_rs/)
+//! to install the WinUSB driver programmatically (requires elevation).
 //! 
 //! # Features
 //! 
@@ -38,13 +43,15 @@
 //! 
 //! See [`Device`] for more examples.
 
+use async_io::Timer;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use rusb::{Context, Device as RusbDevice, Error as RusbError, UsbContext};
+use nusb::{Device as NusbDevice, DeviceInfo as NusbDeviceInfo, Error as NusbError, Interface};
+use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient, TransferError};
 use std::time::Duration;
 
 // Timeout
-const DEFAULT_USB_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_USB_TIMEOUT: Duration = Duration::from_secs(30);
 
 // USB class/subclass codes for DFU
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xFE;
@@ -53,15 +60,14 @@ const USB_SUBCLASS_DFU: u8 = 0x01;
 // DFU block size
 const DFU_BLOCK_SIZE: usize = 2048;
 
-// USB request types (bmRequestType)
-const USB_CLASS_INTERFACE_OUT: u8 = 0x21; // Class, Interface, Host-to-Device
-const USB_CLASS_INTERFACE_IN: u8 = 0xA1;  // Class, Interface, Device-to-Host
-
 // STM32 DFU commands (vendor-specific)
 const STM32_DFU_CMD_SET_ADDRESS: u8 = 0x21;
 const STM32_DFU_CMD_ERASE: u8 = 0x41;
 #[allow(dead_code)]
 const STM32_DFU_CMD_READ_UNPROTECT: u8 = 0x92;
+
+// Language ID for string descriptors
+const LANGUAGE_ID: u16 = 0x0409; // English (United States)
 
 // DFU request types
 #[derive(Debug, Clone, PartialEq)]
@@ -299,6 +305,17 @@ pub enum DfuType {
     Unknown(String),
 }
 
+impl std::fmt::Display for DfuType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DfuType::InternalFlash => write!(f, "Internal Flash"),
+            DfuType::OptionBytes => write!(f, "Option Bytes"),
+            DfuType::SystemMemory => write!(f, "System Memory"),
+            DfuType::Unknown(desc) => write!(f, "Unknown ({})", desc),
+        }
+    }
+}
+
 /// USB device information
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceInfo {
@@ -306,12 +323,58 @@ pub struct DeviceInfo {
     pub vid: u16,
     /// USB device product ID
     pub pid: u16,
-    /// USB interface number
-    pub interface: u8,
-    /// USB bus number
-    pub bus: u8,
+    /// USB bus ID
+    pub bus: String,
     /// USB device address
     pub address: u8,
+    /// DFU information
+    pub dfu: DfuInfo,
+}
+
+impl std::fmt::Display for DeviceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:0>4X}:{:0>4X}",
+            self.vid, self.pid
+        )
+    }
+}
+
+impl DeviceInfo {
+    pub fn from_nusb(info: &NusbDeviceInfo, dfu: DfuInfo) -> Self {
+        let vid = info.vendor_id();
+        let pid = info.product_id();
+        let bus = info.bus_id().to_string();
+        let address = info.device_address();
+
+        DeviceInfo {
+            vid,
+            pid,
+            bus,
+            address,
+            dfu: dfu,
+        }
+    }
+
+    pub fn dfu_type(&self) -> &DfuType {
+        &self.dfu.dfu_type
+    }
+
+    pub fn is_dfu_type(&self, dfu_type: &DfuType) -> bool {
+        self.dfu.dfu_type == *dfu_type
+    }
+
+    pub fn interface(&self) -> u8 {
+        self.dfu.interface
+    }
+}
+
+/// Information about a DFU interface
+#[derive(Debug, Clone, PartialEq)]
+pub struct DfuInfo {
+    /// USB interface number
+    pub interface: u8,
     /// USB alternate setting
     pub alt: u8,
     /// Device description string
@@ -320,12 +383,12 @@ pub struct DeviceInfo {
     pub dfu_type: DfuType,
 }
 
-impl std::fmt::Display for DeviceInfo {
+impl std::fmt::Display for DfuInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:0>4X}:{:0>4X}",
-            self.vid, self.pid,
+            "Interface {}, Alt {}, Type: {}, Desc: {}",
+            self.interface, self.alt, self.dfu_type, self.desc
         )
     }
 }
@@ -336,7 +399,7 @@ impl std::fmt::Display for DeviceInfo {
 /// somewhat esoteric.  [`Error::usb_stack_error()`] can be used to retrieve
 /// the underlying USB stack error for further analysis, or test whether the
 /// failure was a USB stack one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Error {
     /// DFU Device not found
     DeviceNotFound,
@@ -349,13 +412,13 @@ pub enum Error {
     DfuInvalidDeviceStatus,
     /// DFU set address pointer failed
     DfuSetAddressFailed(Status, State),
-    UsbContext(RusbError),
-    UsbDeviceEnumeration(RusbError),
-    UsbDeviceOpen(RusbError),
-    UsbKernelDriverDetach(RusbError),
-    UsbClaimInterface(RusbError),
-    UsbSetAltSetting(RusbError),
-    UsbControlTransfer(RusbError),
+    UsbContext(NusbError),
+    UsbDeviceEnumeration(NusbError),
+    UsbDeviceOpen(NusbError),
+    UsbKernelDriverDetach(NusbError),
+    UsbClaimInterface(NusbError),
+    UsbSetAltSetting(NusbError),
+    UsbControlTransfer(TransferError),
 }
 
 impl std::fmt::Display for Error {
@@ -376,20 +439,34 @@ impl std::fmt::Display for Error {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum UsbStackError {
+    Nusb(NusbError),
+    Transfer(TransferError),
+}
+
 impl Error {
     /// Returns the underlying USB stack error if applicable.
-    pub fn usb_stack_error(&self) -> Option<&RusbError> {
+    pub fn usb_stack_error(&self) -> Option<UsbStackError> {
         match self {
-            Error::UsbContext(e) => Some(e),
-            Error::UsbDeviceEnumeration(e) => Some(e),
-            Error::UsbDeviceOpen(e) => Some(e),
-            Error::UsbKernelDriverDetach(e) => Some(e),
-            Error::UsbClaimInterface(e) => Some(e),
-            Error::UsbSetAltSetting(e) => Some(e),
-            Error::UsbControlTransfer(e) => Some(e),
+            Error::UsbContext(e) => Some(UsbStackError::Nusb(e.clone())),
+            Error::UsbDeviceEnumeration(e) => Some(UsbStackError::Nusb(e.clone())),
+            Error::UsbDeviceOpen(e) => Some(UsbStackError::Nusb(e.clone())),
+            Error::UsbKernelDriverDetach(e) => Some(UsbStackError::Nusb(e.clone())),
+            Error::UsbClaimInterface(e) => Some(UsbStackError::Nusb(e.clone())),
+            Error::UsbSetAltSetting(e) => Some(UsbStackError::Nusb(e.clone())),
+            Error::UsbControlTransfer(e) => Some(UsbStackError::Transfer(e.clone())),
             _ => None,
         }
     }
+}
+
+// Handle object to abstract away Windows + Unix like OS differences
+#[derive(Debug)]
+#[allow(dead_code)]
+struct Handle {
+    device: NusbDevice,
+    interface: Interface,
 }
 
 /// DFU Device representation
@@ -423,10 +500,17 @@ impl Error {
 ///   println!("Uploaded data: {:X?}", &buffer[..16]); // Print first 16 words
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Device {
     info: DeviceInfo,
+    nusb_info: NusbDeviceInfo,
     timeout: Duration,
+}
+
+impl PartialEq for Device {
+    fn eq(&self, other: &Self) -> bool {
+        self.info == other.info
+    }
 }
 
 impl std::fmt::Display for Device {
@@ -434,49 +518,14 @@ impl std::fmt::Display for Device {
         write!(
             f,
             "{} ({:04X}:{:04X})",
-            self.info.desc,
-            self.info.vid,
-            self.info.pid,
+            self.nusb_info.product_string().unwrap_or("Unknown Device"),
+            self.nusb_info.vendor_id(),
+            self.nusb_info.product_id(),
         )
     }
 }
 
 impl Device {
-    /// Enumerates the USB bus and searches for DFU-capable devices.
-    /// 
-    /// Arguments:
-    /// - `filter`: Optional filter to only return devices of a specific DFU type.
-    ///   (such as flash)
-    /// 
-    /// Returns:
-    /// - `Ok(Vec<DeviceInfo>)`: A vector of found DFU devices.
-    /// - `Err(Error)`: An error occurred during USB enumeration.
-    pub fn search(filter: Option<DfuType>) -> Result<Vec<Self>, Error> {
-        let context = Context::new()
-            .map_err(|e| Error::UsbContext(e))?;
-        
-        let devices = context.devices()
-            .map_err(|e| Error::UsbDeviceEnumeration(e))?;
-
-        let mut dfu_devices = Vec::new();
-        
-        for device in devices.iter() {
-            dfu_devices.extend(check_device_for_dfu(&device));
-        }
-
-        let dfu_devices = if let Some(filter) = filter {
-            check_device_for_dfu_type(filter, dfu_devices)
-        } else {
-            dfu_devices
-        };
-
-        let dfu_devices: Vec<Self> = dfu_devices.into_iter()
-            .map(|info| Device::new(info))
-            .collect();
-        
-        Ok(dfu_devices)
-    }
-
     /// Creates a new DFU Device instance from the provided DeviceInfo.
     /// 
     /// Users should primarily use [`Device::search()`] to find and create DFU
@@ -485,19 +534,43 @@ impl Device {
     /// considered inefficient or otherwise insufficient.
     /// 
     /// Arguments:
-    /// - `info`: The DeviceInfo struct representing the DFU device.
+    /// - `nusb_info`: The DeviceInfo object from nusb
+    /// - `dfu_info`: Informaton about the DFU interface of the device
     /// 
     /// Returns:
     /// - `Device`: The created DFU Device instance.
-    pub fn new(info: DeviceInfo) -> Self {
-        Device { 
+    pub fn from_nusb(nusb_info: NusbDeviceInfo, dfu_info: DfuInfo) -> Self {
+        let info = DeviceInfo::from_nusb(&nusb_info, dfu_info);
+
+        Device {
             info,
+            nusb_info,
             timeout: DEFAULT_USB_TIMEOUT,
         }
     }
 
+    pub async fn from_device_info(info: DeviceInfo) -> Result<Self, Error> {
+        // Get USB devices from nusb
+        let devices = nusb::list_devices()
+            .await
+            .map_err(|e| Error::UsbDeviceEnumeration(e))?;
+
+        // Find the matching device
+        let nusb_info = devices.into_iter()
+            .find(|d| d.vendor_id() == info.vid && d.product_id() == info.pid &&
+                      d.bus_id().to_string() == info.bus && d.device_address() == info.address)
+            .ok_or_else(|| Error::DeviceNotFound)?;
+
+        Ok(Device {
+            info,
+            nusb_info,
+            timeout: DEFAULT_USB_TIMEOUT,
+        })
+    }
+
     /// Sets the USB timeout duration for operations.
     pub fn set_timeout(&mut self, timeout: Duration) {
+        debug!("Setting USB timeout to {:?}", timeout);
         self.timeout = timeout;
     }
 
@@ -510,50 +583,44 @@ impl Device {
     /// 
     /// Arguments:
     /// - `address`: The starting address to read from.
-    /// - `buf`: The buffer to fill with read data (in words).
+    /// - `length`: The length of data to read (in bytes).
     /// 
     /// Returns:
     /// - `Ok(())`: The upload was successful, and `buf` is filled
     /// - `Err(Error)`: An error occurred during the upload process.
-    pub fn upload(&self, address: u32, buf: &mut [u32]) -> Result<(), Error> {
-        trace!("Starting DFU upload from address 0x{:08X} for {} words", address, buf.len());
-        let byte_count = buf.len() * 4;
-        let mut bytes = vec![0u8; byte_count];
+    pub async fn upload(&self, address: u32, length: usize) -> Result<Vec<u8>, Error> {
+        trace!("Starting DFU upload from address 0x{:08X} for {} bytes", address, length);
+        let mut bytes = vec![0u8; length];
         
         // Open and setup device
-        let (_context, handle) = self.open_device()?;
+        let handle = self.open().await?;
         trace!("DFU device opened successfully");
         
         // Set address pointer
-        self.set_address(&handle, address)?;
+        self.set_address(&handle, address).await?;
         trace!("DFU address set successfully");
         
         // Abort to return to dfuIDLE before upload
-        self.abort(&handle, false)?;
+        self.abort(&handle, false).await?;
         trace!("DFU aborted to enter dfuIDLE state");
         
         // Calculate blocks needed
-        let total_blocks = (byte_count + DFU_BLOCK_SIZE - 1) / DFU_BLOCK_SIZE;
+        let total_blocks = (length + DFU_BLOCK_SIZE - 1) / DFU_BLOCK_SIZE;
         
         // Read each block
         for block in 0..total_blocks {
-            let block_data = self.read_block(&handle, block)?;
+            let block_data = self.read_block(&handle, block).await?;
             let offset = block * DFU_BLOCK_SIZE;
-            let end = (offset + block_data.len()).min(byte_count);
-            bytes[offset..end].copy_from_slice(&block_data[..end - offset]);
+            let end = (offset + block_data.len()).min(length);
+            bytes[offset..end].copy_from_slice(&block_data);
         }
         trace!("DFU upload completed successfully");
         
         // Final abort
-        self.abort(&handle, true)?;
+        self.abort(&handle, true).await?;
         trace!("DFU session aborted successfully");
         
-        // Convert bytes to words and write to caller's buffer
-        for (ii, chunk) in bytes.chunks_exact(4).enumerate() {
-            buf[ii] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        
-        Ok(())
+        Ok(bytes)
     }
 
     /// Erases flash memory by page/sector
@@ -570,11 +637,11 @@ impl Device {
     /// For STM32F4 with mixed sector sizes, use the smallest sector size
     /// and this will erase more than requested (safe but potentially slower).
     /// Alternatively, call erase_page() directly for each specific sector.
-    pub fn erase(&self, address: u32, length: usize, page_size: usize) -> Result<(), Error> {
+    pub async fn erase(&self, address: u32, length: usize, page_size: usize) -> Result<(), Error> {
         trace!("Starting DFU erase at address 0x{:08X} for {} bytes with page size {}", 
                address, length, page_size);
         
-        let (_context, handle) = self.open_device()?;
+        let handle = self.open().await?;
         trace!("DFU device opened successfully");
         
         // Calculate number of pages to erase
@@ -584,7 +651,7 @@ impl Device {
         for page in 0..total_pages {
             let page_address = address + (page * page_size) as u32;
             trace!("Erasing page {} at address 0x{:08X}", page, page_address);
-            self.erase_page(&handle, page_address)?;
+            self.erase_page(&handle, page_address).await?;
         }
         
         trace!("DFU erase completed successfully");
@@ -595,28 +662,22 @@ impl Device {
     /// 
     /// More efficient than page-by-page erase when erasing the complete flash.
     /// Uses the STM32 mass erase command (0x41 with 0xFF parameter).
-    pub fn mass_erase(&self) -> Result<(), Error> {
+    pub async fn mass_erase(&self) -> Result<(), Error> {
         trace!("Starting DFU mass erase");
         
-        let (_context, handle) = self.open_device()?;
+        let handle = self.open().await?;
         trace!("DFU device opened successfully");
         
         // Mass erase command: Just hte command byte
         let cmd = vec![STM32_DFU_CMD_ERASE];
-        
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::Download.into(),
-            0,
-            self.info.interface as u16,
-            &cmd,
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
-        
-        // Wait for erase to complete
-        self.get_status_check_download_busy(&handle)?;
-        self.get_status(&handle)?;
-        
+        self.control_out(&handle, Request::Download, 0, &cmd).await?;
+
+        // Check we get a busy response
+        self.get_status_check_download_busy(&handle).await?;
+
+        // Now try again
+        self.get_status(&handle).await?;
+
         trace!("DFU mass erase completed successfully");
         Ok(())
     }
@@ -629,47 +690,34 @@ impl Device {
     /// 
     /// Note: Flash must be erased before writing. Use erase() or mass_erase() first.
     /// Data is written in 2KB blocks using the DFU download protocol.
-    pub fn download(&self, address: u32, data: &[u32]) -> Result<(), Error> {
-        trace!("Starting DFU download to address 0x{:08X} for {} words", address, data.len());
+    pub async fn download(&self, address: u32, data: &[u8]) -> Result<(), Error> {
+        trace!("Starting DFU download to address 0x{:08X} for {} bytes", address, data.len());
         
-        // Convert words to bytes
-        let mut bytes = Vec::with_capacity(data.len() * 4);
-        for word in data {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        
-        let (_context, handle) = self.open_device()?;
+        let handle = self.open().await?;
         trace!("DFU device opened successfully");
         
         // Set address pointer
-        self.set_address(&handle, address)?;
+        self.set_address(&handle, address).await?;
         trace!("DFU address set successfully");
         
         // Calculate blocks needed
-        let total_blocks = (bytes.len() + DFU_BLOCK_SIZE - 1) / DFU_BLOCK_SIZE;
-        
+        let total_blocks = (data.len() + DFU_BLOCK_SIZE - 1) / DFU_BLOCK_SIZE;
+
         // Write each block
         for block in 0..total_blocks {
             let start = block * DFU_BLOCK_SIZE;
-            let end = (start + DFU_BLOCK_SIZE).min(bytes.len());
-            
+            let end = (start + DFU_BLOCK_SIZE).min(data.len());
+
             trace!("Writing block {} of {}", block + 1, total_blocks);
-            self.write_block(&handle, block, &bytes[start..end])?;
+            self.write_block(&handle, block, &data[start..end]).await?;
         }
         trace!("DFU download completed successfully");
         
         // Send zero-length download to complete the transfer
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::Download.into(),
-            0,
-            self.info.interface as u16,
-            &[],
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
+        self.control_out(&handle, Request::Download, 0, &[]).await?;
         
         // Final status check to trigger manifest
-        self.get_status(&handle)?;
+        self.get_status(&handle).await?;
         
         trace!("DFU download session completed successfully");
         Ok(())
@@ -678,183 +726,202 @@ impl Device {
 
 // Private helper methods
 impl Device {
-    fn clear_status(&self, handle: &rusb::DeviceHandle<Context>) -> Result<(), Error> {
-        trace!("Clearing DFU status");
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::ClearStatus.into(),
-            0,
-            self.info.interface as u16,
-            &[],
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
-        
-        Ok(())
+    fn is_dfu_type(&self, dfu_type: &DfuType) -> bool {
+        self.info.is_dfu_type(dfu_type)
     }
-    
-    fn open_device(&self) -> Result<(Context, rusb::DeviceHandle<Context>), Error> {
+
+    fn interface(&self) -> u8 {
+        self.info.interface()
+    }
+
+    async fn open(&self) -> Result<Handle, Error> {
         trace!("Opening DFU device: {:?}", self.info);
-        let context = Context::new()
-            .map_err(|e| Error::UsbContext(e))?;
-        
-        let devices = context.devices()
-            .map_err(|e| Error::UsbDeviceEnumeration(e))?;
-        
-        let device = devices.iter()
-            .find(|d| d.bus_number() == self.info.bus && d.address() == self.info.address)
-            .ok_or_else(|| Error::DeviceNotFound)?;
-        
-        #[allow(unused_mut)] // Required mutable on Windows
-        let mut handle = device.open()
+        let nusb_device = self.nusb_info.open()
+            .await
             .map_err(|e| Error::UsbDeviceOpen(e))?;
 
-        // Select configuration 1 (required on Windows)
-        handle.set_active_configuration(1)
-            .map_err(|e| Error::UsbDeviceOpen(e))?;
+        // Check there is an active configuration
+        let _ = nusb_device.active_configuration()
+            .map_err(|e| Error::UsbDeviceOpen(e.into()))?;
         
-        // Detach kernel driver if needed
-        if let Ok(true) = handle.kernel_driver_active(self.info.interface) {
-            handle.detach_kernel_driver(self.info.interface)
-                .map_err(|e| Error::UsbKernelDriverDetach(e))?;
-        }
-        
-        handle.claim_interface(self.info.interface)
+        // Claim interface
+        let interface = self.info.interface();
+        let interface = nusb_device.detach_and_claim_interface(interface).await
             .map_err(|e| Error::UsbClaimInterface(e))?;
-        
-        handle.set_alternate_setting(self.info.interface, self.info.alt)
-            .map_err(|e| Error::UsbSetAltSetting(e))?;
+
+        // Create the "handle"
+        let handle = Handle {
+            device: nusb_device,
+            interface,
+        };
 
         // Initialize the DFU state machine
-        let needs_clear = match self.get_status(&handle) {
+        let needs_clear = match self.get_status(&handle).await {
             Ok(status) => status.is_state_error(),
-            Err(_) => true,  // getStatus failed, needs initialization
+            Err(_) => true,
         };
 
         if needs_clear {
-            self.clear_status(&handle)?;
-            self.get_status(&handle)?;
+            self.clear_status(&handle).await?;
+            self.get_status(&handle).await?;
         }
         
         // Ensure device is in dfuIDLE state for subsequent operations
-        self.abort(&handle, false)?;
+        self.abort(&handle, false).await?;
 
-        Ok((context, handle))
+        Ok(handle)
+    }
+
+
+    #[cfg(not(target_os = "windows"))]
+    async fn control_out(&self, handle: &Handle, request: Request, value: u16, data: &[u8]) -> Result<(), Error> {
+        trace!("Sending DFU control out: {:?}", request);
+        handle.device.control_out(ControlOut {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: request.into(),
+                value,
+                index: self.interface() as u16,
+                data,
+            },
+            self.timeout,
+        ).await.map_err(|e| Error::UsbControlTransfer(e))
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn control_out(&self, handle: &Handle, request: Request, value: u16, data: &[u8]) -> Result<(), Error> {
+        trace!("Sending DFU control out: {:?}", request);
+        handle.interface.control_out(ControlOut {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: request.into(),
+                value,
+                index: self.interface() as u16,
+                data,
+            },
+            self.timeout,
+        ).await.map_err(|e| Error::UsbControlTransfer(e))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    async fn control_in(&self, handle: &Handle, request: Request, value: u16, length: u16) -> Result<Vec<u8>, Error> {
+        trace!("Sending DFU control in: {:?}", request);
+        handle.device.control_in(ControlIn {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: request.into(),
+                value,
+                index: self.interface() as u16,
+                length
+            },
+            self.timeout,
+        ).await.map_err(|e| Error::UsbControlTransfer(e))
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn control_in(&self, handle: &Handle, request: Request, value: u16, length: u16) -> Result<Vec<u8>, Error> {
+        trace!("Sending DFU control in: {:?}", request);
+        handle.interface.control_in(ControlIn {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: request.into(),
+                value,
+                index: self.interface() as u16,
+                length
+            },
+            self.timeout,
+        ).await.map_err(|e| Error::UsbControlTransfer(e))
     }
     
-    fn set_address(&self, handle: &rusb::DeviceHandle<Context>, address: u32) -> Result<(), Error> {
+    async fn clear_status(&self, handle: &Handle) -> Result<(), Error> {
+        trace!("Clearing DFU status");
+        self.control_out(handle, Request::ClearStatus, 0, &[]).await
+    }
+    
+    async fn set_address(&self, handle: &Handle, address: u32) -> Result<(), Error> {
         trace!("Setting DFU address to 0x{:08X}", address);
         trace!("DFU info {:?}", self.info);
 
         // Command: 0x21 followed by address in little-endian
         let mut cmd = vec![STM32_DFU_CMD_SET_ADDRESS];
         cmd.extend_from_slice(&address.to_le_bytes());
-        
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::Download.into(),
-            0,    // wValue: 0 for command mode
-            self.info.interface as u16,
-            &cmd,
-            self.timeout
-        )
-            .inspect_err(|e| warn!("Control transfer error during set_address: {e}"))
-            .map_err(|e| Error::UsbControlTransfer(e))?;
-        
+
+        self.control_out(handle, Request::Download, 0, &cmd).await?;
+
         // First get status after write address should return download busy
-        self.get_status_check_download_busy(handle)?;
-        self.get_status(handle)?;
-        
+        self.get_status_check_download_busy(handle).await?;
+        self.get_status(handle).await?;
+
         Ok(())
     }
 
-    fn erase_page(&self, handle: &rusb::DeviceHandle<Context>, address: u32) -> Result<(), Error> {
+    async fn erase_page(&self, handle: &Handle, address: u32) -> Result<(), Error> {
         trace!("Erasing page at address 0x{:08X}", address);
         
         // Command: 0x41 followed by address in little-endian
         let mut cmd = vec![STM32_DFU_CMD_ERASE];
         cmd.extend_from_slice(&address.to_le_bytes());
         
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::Download.into(),
-            0,    // wValue: 0 for command mode
-            self.info.interface as u16,
-            &cmd,
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
+        self.control_out(handle, Request::Download, 0, &cmd).await?;
         
         // Wait for erase to complete - can take significant time
-        self.get_status_check_download_busy(handle)?;
-        self.get_status(handle)?;
-        
+        self.get_status_check_download_busy(handle).await?;
+        self.get_status(handle).await?;
+
         Ok(())
     }
 
-    fn abort(&self, handle: &rusb::DeviceHandle<Context>, get_status: bool) -> Result<(), Error> {
+    async fn abort(&self, handle: &Handle, get_status: bool) -> Result<(), Error> {
         trace!("Sending DFU abort");
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::Abort.into(),
-            0,
-            self.info.interface as u16,
-            &[],
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
-        
+        self.control_out(handle, Request::Abort, 0, &[]).await?;
+
         if get_status {
-            self.get_status(handle)?;
+            self.get_status(handle).await?;
         }
         
         Ok(())
     }
     
-    fn read_block(&self, handle: &rusb::DeviceHandle<Context>, block: usize) -> Result<Vec<u8>, Error> {
+    async fn read_block(&self, handle: &Handle, block: usize) -> Result<Vec<u8>, Error> {
         trace!("Reading DFU block {}", block);
-        let mut buf = vec![0u8; DFU_BLOCK_SIZE];
-        
-        let bytes_read = handle.read_control(
-            USB_CLASS_INTERFACE_IN,
-            Request::Upload.into(),
-            (2 + block) as u16, // wValue: block number + 2
-            self.info.interface as u16,
-            &mut buf,
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
-        
-        buf.truncate(bytes_read);
-        
-        self.get_status(handle)?;
-        self.get_status(handle)?;
-        
-        Ok(buf)
+
+        let data = self.control_in(
+            handle,
+            Request::Upload,
+            (2 + block) as u16,
+            DFU_BLOCK_SIZE as u16,
+        ).await?;
+
+        self.get_status(handle).await?;
+        self.get_status(handle).await?;
+
+        Ok(data)
     }
     
-    fn write_block(&self, handle: &rusb::DeviceHandle<Context>, block: usize, data: &[u8]) -> Result<(), Error> {
+    async fn write_block(&self, handle: &Handle, block: usize, data: &[u8]) -> Result<(), Error> {
         trace!("Writing DFU block {} ({} bytes)", block, data.len());
         
         // Prepare 2KB block, padding with 0xFF if needed
         let mut block_data = vec![0xFF; DFU_BLOCK_SIZE];
         block_data[..data.len()].copy_from_slice(data);
-        
-        handle.write_control(
-            USB_CLASS_INTERFACE_OUT,
-            Request::Download.into(),
-            (2 + block) as u16, // wValue: block number + 2
-            self.info.interface as u16,
+
+        self.control_out(
+            handle,
+            Request::Download,
+        (2 + block) as u16,
             &block_data,
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
+        ).await?;
         
         // Wait for write to complete
-        self.get_status_check_download_busy(handle)?;
-        self.get_status(handle)?;
+        self.get_status_check_download_busy(handle).await?;
+        self.get_status(handle).await?;
 
         Ok(())
     }
 
     // Returns Err(Error) if device is not in download busy state
-    fn get_status_check_download_busy(&self, handle: &rusb::DeviceHandle<Context>) -> Result<(), Error> {
-        let status = self.get_status_error_flag(handle, true)?;
+    async fn get_status_check_download_busy(&self, handle: &Handle) -> Result<(), Error> {
+        let status = self.get_status_error_flag(handle, true).await?;
         if !status.is_download_busy() {
             return Err(Error::DfuStatus{ status: status.status(), state: status.state() })
         }
@@ -862,27 +929,25 @@ impl Device {
     }
 
     // Returns Err(Error) if any error status/state is reported
-    fn get_status(&self, handle: &rusb::DeviceHandle<Context>) -> Result<DeviceStatus, Error> {
-        self.get_status_error_flag(handle, false)
+    async fn get_status(&self, handle: &Handle) -> Result<DeviceStatus, Error> {
+        self.get_status_error_flag(&handle, false).await
     }
 
-    fn get_status_error_flag(&self, handle: &rusb::DeviceHandle<Context>, error_ok: bool) -> Result<DeviceStatus, Error> {
+    async fn get_status_error_flag(&self, handle: &Handle, error_ok: bool) -> Result<DeviceStatus, Error> {
         trace!("Getting DFU status");
-        let mut data = [0u8; Request::GetStatus.fixed_length()];
-        handle.read_control(
-            USB_CLASS_INTERFACE_IN,
-            Request::GetStatus.into(),
+        let data = self.control_in(
+            handle,
+            Request::GetStatus,
             0,
-            self.info.interface as u16,
-            &mut data,
-            self.timeout
-        ).map_err(|e| Error::UsbControlTransfer(e))?;
+            Request::GetStatus.fixed_length() as u16,
+        ).await?;
 
         let status = DeviceStatus::from_packet(&data)?;
         
         // Wait for poll time
-        std::thread::sleep(std::time::Duration::from_millis(status.poll_time() as u64));
-        
+        trace!("Waiting for DFU poll time: {} ms", status.poll_time());
+        Timer::after(Duration::from_millis(status.poll_time() as u64)).await;
+
         if !error_ok && status.is_error() {
             return Err(Error::DfuStatus{ status: status.status(), state: status.state() });
         }
@@ -891,67 +956,7 @@ impl Device {
     }
 }
 
-fn check_device_for_dfu_type(filter: DfuType, device_info: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
-    device_info.into_iter()
-        .filter(|info| info.dfu_type == filter)
-        .collect()
-}
-
-fn check_device_for_dfu(device: &RusbDevice<Context>) -> Vec<DeviceInfo> {
-    let mut results = Vec::new();
-    
-    let desc = match device.device_descriptor() {
-        Ok(d) => d,
-        Err(_) => return results,
-    };
-    
-    let vid = desc.vendor_id();
-    let pid = desc.product_id();
-    let bus = device.bus_number();
-    let address = device.address();
-    
-    for config_idx in 0..desc.num_configurations() {
-        let config = match device.config_descriptor(config_idx) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        
-        for interface in config.interfaces() {
-            for iface_desc in interface.descriptors() {
-                if iface_desc.class_code() == USB_CLASS_APPLICATION_SPECIFIC && iface_desc.sub_class_code() == USB_SUBCLASS_DFU {
-                    let alt = iface_desc.setting_number();
-                    let desc_string = get_interface_string(device, &iface_desc);
-                    let dfu_type = parse_dfu_type(&desc_string);
-                    
-                    results.push(DeviceInfo {
-                        vid,
-                        pid,
-                        interface: interface.number(),
-                        bus,
-                        address,
-                        alt,
-                        desc: desc_string,
-                        dfu_type,
-                    });
-                }
-            }
-        }
-    }
-    
-    results
-}
-
-fn get_interface_string(
-    device: &RusbDevice<Context>,
-    iface_desc: &rusb::InterfaceDescriptor,
-) -> String {
-    device.open()
-        .and_then(|handle| {
-            handle.read_string_descriptor_ascii(iface_desc.description_string_index().unwrap_or(0))
-        })
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
-
+// Parses the DFU type from the USB interface description string
 fn parse_dfu_type(desc: &str) -> DfuType {
     // Look for @Region Name / pattern
     if let Some(at_pos) = desc.find('@') {
@@ -968,4 +973,117 @@ fn parse_dfu_type(desc: &str) -> DfuType {
     }
     
     DfuType::Unknown(desc.to_string())
+}
+
+// Checks a single USB device for DFU interfaces, returning any found
+async fn check_device_for_dfu(timeout: Duration, device_info: &NusbDeviceInfo) -> Option<Vec<Device>> {
+    // First of all check if this device has any interfaces with a DFU class/subclass
+    let mut dfu_device = false;
+    for interface in device_info.interfaces() {
+        let class = interface.class();
+        let subclass = interface.subclass();
+        if class == USB_CLASS_APPLICATION_SPECIFIC && subclass == USB_SUBCLASS_DFU {
+            dfu_device = true;
+            break;
+        }
+    }
+
+    if !dfu_device {
+        return None
+    }
+
+
+    // Open the device
+    let vid = device_info.vendor_id();
+    let pid = device_info.product_id();
+    let device = match device_info.open().await {
+        Ok(dev) => dev,
+        Err(e) => {
+            warn!("Failed to open USB device {vid:04X}:{pid:04X} for DFU interface check: {e}");
+            return None
+        }
+    };
+
+    // Get the active configuration
+    let config = match device.active_configuration() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to get active configuration for USB device {vid:04X}:{pid:04X}: {e}");
+            return None
+        }
+    };
+
+    // Iterate through all interfaces and alt settings of this config
+    let mut results = Vec::new();
+    for interface in config.interface_alt_settings() {
+        let string_index = interface.string_index();
+        if let Some(index) = string_index {
+            // Read the interface string;
+            let desc_str = match device.get_string_descriptor(index, LANGUAGE_ID, timeout).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to read interface string for USB device {vid:04X}:{pid:04X}: {e}");
+                    "Unknown".to_string();
+                    return None;
+                }
+            };
+
+            let dfu_type = parse_dfu_type(&desc_str);
+            let dfu_info = DfuInfo {
+                interface: interface.interface_number(),
+                alt: interface.alternate_setting(),
+                desc: desc_str,
+                dfu_type,
+            };
+
+            let device = Device::from_nusb(device_info.clone(), dfu_info);
+            trace!("Found DFU-capable device: {device}");
+            results.push(device);
+        }
+    }
+    
+    Some(results)
+}
+
+/// Enumerates the USB bus and searches for DFU-capable devices.
+/// 
+/// Arguments:
+/// - `filter`: Optional filter to only return devices of a specific DFU type.
+///   (such as flash)
+/// 
+/// Returns:
+/// - `Ok(Vec<DeviceInfo>)`: A vector of found DFU devices.
+/// - `Err(Error)`: An error occurred during USB enumeration.
+pub async fn search_for_dfu(timeout: Duration, filter: Option<DfuType>) -> Result<Vec<Device>, Error> {
+    // Get USB devices from nusb
+    let devices = nusb::list_devices()
+        .await
+        .map_err(|e| Error::UsbDeviceEnumeration(e))?;
+
+    // Build the DFU devices list, checking each device for DFU capability
+    let mut dfu_devices = Vec::new();
+    for device in devices {
+        if let Some(info) = check_device_for_dfu(timeout, &device).await {
+            dfu_devices.extend(info);
+        }
+    }
+
+    // If there's an optional filter, apply it now
+    let filtered_dfu_devices = if let Some(filter) = &filter {
+        dfu_devices.iter()
+            .filter(|device| {
+                trace!("Checking device {} for DFU type {:?}", device, filter);
+                let is_match = device.is_dfu_type(filter);
+                if is_match {
+                    trace!("Device {} matches DFU type {:?}", device, filter);
+                }
+                is_match
+            })
+            .cloned()
+            .collect()
+    } else {
+        dfu_devices
+    };
+
+    Ok(filtered_dfu_devices)
 }

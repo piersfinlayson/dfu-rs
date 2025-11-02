@@ -980,9 +980,11 @@ async fn check_device_for_dfu(timeout: Duration, device_info: &NusbDeviceInfo) -
     // First of all check if this device has any interfaces with a DFU class/subclass
     let mut dfu_device = false;
     for interface in device_info.interfaces() {
+        trace!("Checking {device_info:?} interface {interface:?} for DFU class/subclass");
         let class = interface.class();
         let subclass = interface.subclass();
         if class == USB_CLASS_APPLICATION_SPECIFIC && subclass == USB_SUBCLASS_DFU {
+            trace!("Found DFU interface");
             dfu_device = true;
             break;
         }

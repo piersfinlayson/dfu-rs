@@ -368,6 +368,14 @@ impl DeviceInfo {
     pub fn interface(&self) -> u8 {
         self.dfu.interface
     }
+
+    pub fn vid(&self) -> u16 {
+        self.vid
+    }   
+
+    pub fn pid(&self) -> u16 {
+        self.pid
+    }
 }
 
 /// Information about a DFU interface
@@ -993,7 +1001,6 @@ async fn check_device_for_dfu(timeout: Duration, device_info: &NusbDeviceInfo) -
     if !dfu_device {
         return None
     }
-
 
     // Open the device
     let vid = device_info.vendor_id();
